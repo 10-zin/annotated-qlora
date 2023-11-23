@@ -1,6 +1,23 @@
 from dataclasses import dataclass
+import torch
+from torch.nn.modules.normalization import LayerNorm
+
 
 @dataclass
 class Config:
     name: str = ""
-    block_size: int = 4096 
+    block_size: int = 2048
+    n_embed: int = 512
+    n_head: int = 8
+    n_layer: int = 6
+    vocab_size: int = 50304
+    padded_vocab_size: int = 50304
+    norm_eps: float = 1e-5
+    lm_head_bias: bool = False  # why no bias ?? not sure
+    shared_attention_norm: bool = False
+    intermediate_size: int = 4 * n_embed
+    bias: bool = True
+    gelu_approximate: str = "none"
+    parallel_residual: bool = True
+
+    norm_class: LayerNorm = LayerNorm
