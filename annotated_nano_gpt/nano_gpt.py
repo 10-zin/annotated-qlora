@@ -1,5 +1,6 @@
 import math
-from typing import Optional
+from typing import Any, Optional, Tuple
+from typing_extensions import Self
 import torch
 import torch.nn as nn
 
@@ -10,41 +11,131 @@ class GPT(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.config = config
-        self.lm_head = nn.Linear(
-            config.n_embed, config.padded_vocab_size, bias=config.lm_head_bias
-        )
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embed),
                 h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=config.norm_class,
+                ln_f=config.norm_class(config.n_embed, eps=config.norm_eps),
             )
+        )
+        self.lm_head = nn.Linear(
+            config.n_embed, config.padded_vocab_size, bias=config.lm_head_bias
         )
         self.max_seq_length = self.config.block_size
         self.mask_cache: Optional[torch.Tensor] = None
 
+    @property
+    def max_seq_length(self) -> int:
+        return self._max_seq_length
+    
+    @max_seq_length.setter
+    def max_seq_length(self, value: int) -> None:
+        if value > self.config.block_size:
+            raise ValueError("Cannot attend to {value}, block size is only {self.config.block_size}.")
+        
+        self._max_seq_length = value
+        if not hasattr(self, "cos"):
+            cos, sin = self.rope_cache()
+            self.register_buffer("cos", cos, persistent=False)
+            self.register_buffer("sin", sin, persistent=False)
+
+        elif value != self.cos.size(0):
+            self.cos, self.sin = self.rope_cache(device=self.cos.device)
+
+    def reset_parameters(self) -> None:
+        self.max_seq_length = self.config.block_size
+
+    def _init_weights(slef, module: nn.Module) -> None:
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
     def forward(self, idx: torch.Tensor, input_pos: Optional[torch.Tensor] = None):
         # estimte cos sin
         # --------------------
+        # TO Understand
+        T = idx.size(1)
+        if self.max_seq_length < T:
+            raise ValueError(f"Cannot forward sequence of length {T}, max seq length is only {self.max_seq_length}.")
+
+        if input_pos is not None:  # use the kv cache
+            cos = self.cos.index_select(0, input_pos)
+            sin = self.sin.index_select(0, input_pos)
+            if self.mask_cache is None:
+                raise TypeError("You need to call `gpt.set_kv_cache()`")
+            mask = self.mask_cache.index_select(2, input_pos)
+        else:
+            cos = self.cos[:T]
+            sin = self.sin[:T]
+            mask = None
+        # -----------------
 
         # forward pass
-        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
+        x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embed)
         for block in self.transformer.h:
             x = block(x, cos, sin, mask, input_pos)
 
         x = self.transformer.ln_f(x)  # whyy all of a sudden ln_f in the last??
         return self.lm_head(x)  # (b, t, vocab_size)
+    
+    #R-Todo: Understand working ---------------------------------------
+    @classmethod
+    def from_name(cls, name: str, **kwargs: Any) -> Self:
+        return cls(Config.from_name(name, **kwargs))
+
+    def rope_cache(self, device: Optional[torch.device] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        a = build_rope_cache(
+            seq_len=self.max_seq_length,
+            n_elem=self.config.rope_n_elem,
+            device=device,
+            condense_ratio=self.config.rope_condense_ratio,
+            base=self.config.rope_base,
+        )
+        return a
+
+    def set_kv_cache(
+        self,
+        batch_size: int,
+        rope_cache_length: Optional[int] = None,
+        device: Optional[torch.device] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> None:
+        if rope_cache_length is None:
+            rope_cache_length = self.cos.size(-1)
+        max_seq_length = self.max_seq_length
+
+        # initialize the kv cache for all blocks
+        for block in self.transformer.h:
+            block.attn.kv_cache = block.attn.build_kv_cache(
+                batch_size, max_seq_length, rope_cache_length, device, dtype
+            )
+
+        if self.mask_cache is None or self.mask_cache.size(3) != max_seq_length:
+            # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need the mask
+            # for the kv-cache support (only during inference), we only create it in that situation
+            # this will be resolved by https://github.com/pytorch/pytorch/issues/96099
+            ones = torch.ones((max_seq_length, max_seq_length), device=device, dtype=torch.bool)
+            self.mask_cache = torch.tril(ones).unsqueeze(0).unsqueeze(0)
+
+    def clear_kv_cache(self) -> None:
+        self.mask_cache = None
+        for block in self.transformer.h:
+            block.attn.kv_cache = None
+
 
 
 class Block(nn.Module):
     def __init__(self, config: Config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
-        self.ln_1 = config.norm_class(config.n_embed, eps=config.norm_eps)
+        self.ln_1 = config.norm_class(config.n_embed, config.norm_eps)
         self.ln_2 = (
             None
             if config.shared_attention_norm
-            else config.norm_class(config.n_embed, eps=config.norm_eps)
+            else config.norm_class(config.n_embed, config.norm_eps)
         )
         self.mlp = MLP(config)
         self.config=config
@@ -60,7 +151,7 @@ class Block(nn.Module):
         n_1 = self.ln_1(x)
         h = self.attn(x, cos, sin, mask, input_pos)
         if self.config.parallel_residual:
-            n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
+            n_2 = n_1 if self.config.shared_attention_norm else self.ln_2(x)
             x = self.mlp(n_2) + h + x
 
         x = h + x
@@ -74,6 +165,7 @@ class CausalSelfAttention(nn.Module):
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         self.attn = nn.Linear(config.n_embed, shape, bias=config.bias)
         self.kv_cache: Optional[KVCache] = None
+        self.proj = nn.Linear(config.n_embed, config.n_embed, bias=config.bias)
         self.config=config
 
     def get_q_k_v_less_complicated(self, qkv, B, T, input_pos):
@@ -214,6 +306,27 @@ class KVCache(nn.Module):
         torch.nn.init.zeros_(self.v)
 
 
+def build_rope_cache(
+    seq_len: int, n_elem: int, device: Optional[torch.device] = None, base: int = 10000, condense_ratio: int = 1
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Enhanced Transformer with Rotary Position Embedding.
+
+    Derived from: https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/labml_nn/
+    transformers/rope/__init__.py. MIT License:
+    https://github.com/labmlai/annotated_deep_learning_paper_implementations/blob/master/license.
+    """
+    # $\Theta = {\theta_i = 10000^{\frac{2(i-1)}{d}}, i \in [1, 2, ..., \frac{d}{2}]}$
+    theta = 1.0 / (base ** (torch.arange(0, n_elem, 2, device=device).float() / n_elem))
+
+    # Create position indexes `[0, 1, ..., seq_len - 1]`
+    seq_idx = torch.arange(seq_len, device=device) / condense_ratio
+
+    # Calculate the product of position index and $\theta_i$
+    idx_theta = torch.outer(seq_idx, theta).repeat(1, 2)
+
+    return torch.cos(idx_theta), torch.sin(idx_theta)
+
+
 def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
     head_size = x.size(-1)
     x1 = x[..., : head_size // 2]  # (B, nh, T, hs/2)
@@ -221,6 +334,5 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
     roped = (x * cos) + (rotated * sin)
     return roped.type_as(x)
-
 
 
