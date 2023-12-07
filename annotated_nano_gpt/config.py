@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from typing import Literal, Type
 import torch
 from torch.nn.modules.normalization import LayerNorm
 
@@ -23,6 +24,12 @@ class Config:
     parallel_residual: bool = True
     rotary_percentage: float=0.25
     rope_n_elem = int(rotary_percentage * head_size)
+    _norm_class: Literal["LayerNorm", "RMSNorm"] = "LayerNorm"
+    rope_condense_ratio: int = 1
+    rope_base: int = 10000
 
-
-    norm_class: LayerNorm = LayerNorm
+    @property
+    def norm_class(self) -> Type:
+        if self._norm_class == "RMSNorm":
+            raise ValueError("Not implemented yet")
+        return getattr(torch.nn, self._norm_class)
